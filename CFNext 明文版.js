@@ -3228,7 +3228,7 @@ code.hl{background:var(--card2);padding:2px 6px;border-radius:5px;font-family:ui
 <button class="btn primary" id="saveBtn" onclick="saveAll()">保存全部</button></div>
 <div class="toast" id="toast"></div>
 <script>
-var APIPATH = location.pathname;
+var APIPATH = (location.pathname || '').replace(/\/+$/, '') || '/';
 var CFG = null;
 function $(id){ return document.getElementById(id); }
 function api(p, opts){
