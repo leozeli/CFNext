@@ -3515,12 +3515,13 @@ async function handleRequest(request, env) {
     if (cfg.admin) {
       return new Response(loginHTML, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
-    return Response.redirect(new URL('/' + panelPath, request.url).href, 302);
+    // 未设 ADMIN 时 /login 也不得 302 到能力 URL（探活即可拿到 path/UUID）
+    return new Response('Not Found', { status: 404 });
   }
   const isPanelRoot = segs[0] === panelPath;
-  // 根路径：浏览器访问自动跳转到面板入口，避免 Not Found 困惑（上手即用）
+  // 根路径不把 panelPath/UUID 写进 Location。workers.dev 与任意 Host 的 GET / 都是公开入口。
   if (segs[0] === '' && isBrowserUA(UA)) {
-    return Response.redirect(new URL('/' + panelPath, request.url).href, 302);
+    return new Response('Not Found', { status: 404 });
   }
   // ---------- 代理：WebSocket / xhttp ----------
   if (isPanelRoot && segs.length === 1) {
