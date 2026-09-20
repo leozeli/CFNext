@@ -15,7 +15,7 @@
 //    YX           自定义优选 IP 列表（可选，格式 IP:port#名称，逗号分隔）
 //    YXURL        优选器自定义数据源 URL（可选）
 //    BESTIP_AUTO  设为 1 启用定时自动优选（scheduled 触发，刷新优选节点）
-//    K            已绑定 KV 命名空间时读取图形化配置（config / issued / usage）
+//    K            已绑定 KV 命名空间时读取图形化配置（config / issued）
 // ============================================================================
 import { connect } from 'cloudflare:sockets';
 const VERSION = '1.0.6';
@@ -853,275 +853,13 @@ async function saveConfig(env, cfg) {
   return true;
 }
 // ---------------------------------------------------------------------------
-// 用量统计：隔离体内聚合，节流写入同一个 KV 键 usage
-// 不记录访问目标域名 / 原始 IP；客户端用 UA 族 + IP 短哈希区分
-// 免费 KV 写入有限：默认至少间隔 90s 才落盘（面板查看时强制刷新）
-// ---------------------------------------------------------------------------
-const USAGE_KV_KEY = 'usage';
-const USAGE_DAYS = 14;
-const USAGE_TOP = 24;
-const USAGE_MIN_FLUSH_MS = 90000;
 // 轮询键 issued：每个订阅拉取都 put 会打满免费 KV 每日 1000 次写入。
-// 与 usage 一样按隔离体节流；窗口 IP 未变化则完全跳过写入。
+// 按隔离体节流；窗口 IP 未变化则完全跳过写入。
+// ---------------------------------------------------------------------------
 const ISSUED_KV_KEY = 'issued';
 const ISSUED_MIN_PUT_MS = 90000;
 let _issuedLastPut = 0;
 let _issuedLastIps = '';
-const USAGE_TZ_MS = 8 * 3600 * 1000;   // 按北京时间（UTC+8）切日
-let _usageBuf = null;
-let _usageLastPut = 0;
-let _usageFlushing = false;
-let _usageFlushWait = null;
-
-function usageDayKey(ts) {
-  return new Date((ts || Date.now()) + USAGE_TZ_MS).toISOString().slice(0, 10);
-}
-function usageHour(ts) {
-  return new Date((ts || Date.now()) + USAGE_TZ_MS).getUTCHours();
-}
-function emptyUsageDay(day) {
-  return {
-    day,
-    totals: { reqs: 0, conns: 0, subs: 0, bytesIn: 0, bytesOut: 0 },
-    hourly: Array.from({ length: 24 }, () => ({ reqs: 0, bytesIn: 0, bytesOut: 0 })),
-    byProtocol: {},
-    byNode: {},
-    byOutbound: {},
-    byClient: {},
-    clientHashes: []
-  };
-}
-function emptyUsageStore() {
-  return { v: 1, updatedAt: 0, days: {} };
-}
-function usageByteLen(data) {
-  if (!data) return 0;
-  if (typeof data.byteLength === 'number') return data.byteLength;
-  if (typeof data === 'string') return data.length;
-  if (typeof data.length === 'number') return data.length;
-  return 0;
-}
-function classifyClientUA(ua, format) {
-  const f = (format || '').toLowerCase();
-  if (f === 'clash' || f === 'stash') return 'Clash';
-  if (f === 'singbox' || f === 'sing-box') return 'Sing-box';
-  if (f === 'surge') return 'Surge';
-  if (f === 'loon') return 'Loon';
-  if (f === 'quanx' || f === 'quantumultx') return 'Quantumult X';
-  if (f === 'v2ray' || f === 'v2rayn' || f === 'shadowrocket' || f === 'nekoray') return 'v2ray';
-  const u = (ua || '').toLowerCase();
-  if (u.includes('clash') || u.includes('stash') || u.includes('mihomo')) return 'Clash';
-  if (u.includes('sing-box') || u.includes('singbox')) return 'Sing-box';
-  if (u.includes('surge')) return 'Surge';
-  if (u.includes('loon')) return 'Loon';
-  if (u.includes('quantumult')) return 'Quantumult X';
-  if (u.includes('v2ray') || u.includes('v2rayng') || u.includes('shadowrocket') || u.includes('nekoray') || u.includes('xray')) return 'v2ray';
-  if (u.includes('mozilla')) return '浏览器';
-  if (!u) return '未知客户端';
-  return '其他';
-}
-function bumpUsageMap(map, key, rec, cap) {
-  if (!key) return;
-  const cur = map[key] || { reqs: 0, conns: 0, subs: 0, bytesIn: 0, bytesOut: 0 };
-  cur.reqs += rec.reqs || 0;
-  cur.conns += rec.conns || 0;
-  cur.subs += rec.subs || 0;
-  cur.bytesIn += rec.bytesIn || 0;
-  cur.bytesOut += rec.bytesOut || 0;
-  map[key] = cur;
-  if (!cap) return;
-  const keys = Object.keys(map);
-  if (keys.length <= cap) return;
-  keys.sort((a, b) => (map[b].bytesIn + map[b].bytesOut + map[b].reqs) - (map[a].bytesIn + map[a].bytesOut + map[a].reqs));
-  for (let i = cap; i < keys.length; i++) delete map[keys[i]];
-}
-function mergeUsageDay(dst, src) {
-  if (!src) return dst;
-  const t = dst.totals, s = src.totals || {};
-  t.reqs += s.reqs || 0;
-  t.conns += s.conns || 0;
-  t.subs += s.subs || 0;
-  t.bytesIn += s.bytesIn || 0;
-  t.bytesOut += s.bytesOut || 0;
-  const dh = dst.hourly || (dst.hourly = emptyUsageDay(dst.day).hourly);
-  const sh = src.hourly || [];
-  for (let i = 0; i < 24; i++) {
-    const a = dh[i] || (dh[i] = { reqs: 0, bytesIn: 0, bytesOut: 0 });
-    const b = sh[i] || {};
-    a.reqs += b.reqs || 0;
-    a.bytesIn += b.bytesIn || 0;
-    a.bytesOut += b.bytesOut || 0;
-  }
-  for (const [k, v] of Object.entries(src.byProtocol || {})) bumpUsageMap(dst.byProtocol, k, v, 16);
-  for (const [k, v] of Object.entries(src.byNode || {})) bumpUsageMap(dst.byNode, k, v, USAGE_TOP);
-  for (const [k, v] of Object.entries(src.byOutbound || {})) bumpUsageMap(dst.byOutbound, k, v, 16);
-  for (const [k, v] of Object.entries(src.byClient || {})) bumpUsageMap(dst.byClient, k, v, USAGE_TOP);
-  const hashes = dst.clientHashes || (dst.clientHashes = []);
-  for (const h of (src.clientHashes || [])) {
-    if (hashes.length >= 200) break;
-    if (hashes.indexOf(h) < 0) hashes.push(h);
-  }
-  return dst;
-}
-function applyUsageRec(day, rec) {
-  const add = {
-    reqs: rec.reqs || 0,
-    conns: rec.conns || 0,
-    subs: rec.subs || 0,
-    bytesIn: rec.bytesIn || 0,
-    bytesOut: rec.bytesOut || 0
-  };
-  day.totals.reqs += add.reqs;
-  day.totals.conns += add.conns;
-  day.totals.subs += add.subs;
-  day.totals.bytesIn += add.bytesIn;
-  day.totals.bytesOut += add.bytesOut;
-  const hour = (typeof rec.hour === 'number') ? rec.hour : usageHour(rec.ts);
-  const slot = day.hourly[hour] || (day.hourly[hour] = { reqs: 0, bytesIn: 0, bytesOut: 0 });
-  slot.reqs += add.reqs;
-  slot.bytesIn += add.bytesIn;
-  slot.bytesOut += add.bytesOut;
-  if (rec.protocol) bumpUsageMap(day.byProtocol, rec.protocol, add, 16);
-  if (rec.node) bumpUsageMap(day.byNode, rec.node, add, USAGE_TOP);
-  if (rec.outbound) bumpUsageMap(day.byOutbound, rec.outbound, add, 16);
-  if (rec.client) bumpUsageMap(day.byClient, rec.client, add, USAGE_TOP);
-  if (rec.clientHash && day.clientHashes.length < 200 && day.clientHashes.indexOf(rec.clientHash) < 0) {
-    day.clientHashes.push(rec.clientHash);
-  }
-}
-function pruneUsageDays(store) {
-  const keys = Object.keys(store.days || {}).sort();
-  while (keys.length > USAGE_DAYS) {
-    delete store.days[keys.shift()];
-  }
-}
-function noteUsage(env, rec) {
-  if (!rec) return;
-  const ts = rec.ts || Date.now();
-  const dayKey = usageDayKey(ts);
-  if (!_usageBuf || _usageBuf.day !== dayKey) _usageBuf = emptyUsageDay(dayKey);
-  applyUsageRec(_usageBuf, Object.assign({ ts }, rec));
-  scheduleUsageFlush(env, false);
-}
-function scheduleUsageFlush(env, force) {
-  if (!env || !env.K || typeof env.K.put !== 'function') return;
-  const run = () => flushUsage(env, force).catch(() => {});
-  if (env._ctx && typeof env._ctx.waitUntil === 'function') env._ctx.waitUntil(run());
-  else run();
-}
-function usageBufHasData(buf) {
-  if (!buf || !buf.totals) return false;
-  return !!(buf.totals.reqs || buf.totals.subs || buf.totals.bytesIn || buf.totals.bytesOut || buf.totals.conns);
-}
-async function flushUsage(env, force, depth) {
-  depth = depth || 0;
-  if (_usageFlushing) {
-    if (force && _usageFlushWait) {
-      await _usageFlushWait;
-      return flushUsage(env, force, depth);
-    }
-    return;
-  }
-  if (!usageBufHasData(_usageBuf)) return;
-  if (!force && _usageLastPut && (Date.now() - _usageLastPut) < USAGE_MIN_FLUSH_MS) return;
-  if (!env.K || typeof env.K.put !== 'function') return;
-  _usageFlushing = true;
-  let resolveWait = null;
-  _usageFlushWait = new Promise((r) => { resolveWait = r; });
-  const snap = _usageBuf;
-  _usageBuf = emptyUsageDay(snap.day);
-  try {
-    let store = emptyUsageStore();
-    try {
-      const raw = await env.K.get(USAGE_KV_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (parsed && parsed.days) store = parsed;
-      }
-    } catch (e) { /* 忽略损坏数据，重建 */ }
-    if (!store.days) store.days = {};
-    const day = store.days[snap.day] || emptyUsageDay(snap.day);
-    mergeUsageDay(day, snap);
-    store.days[snap.day] = day;
-    pruneUsageDays(store);
-    store.updatedAt = Date.now();
-    store.v = 1;
-    await env.K.put(USAGE_KV_KEY, JSON.stringify(store));
-    _usageLastPut = Date.now();
-  } catch (e) {
-    mergeUsageDay(_usageBuf, snap);
-  } finally {
-    _usageFlushing = false;
-    if (resolveWait) resolveWait();
-    _usageFlushWait = null;
-  }
-  if (depth < 2 && usageBufHasData(_usageBuf)) await flushUsage(env, true, depth + 1);
-}
-async function readUsage(env, forceFlush) {
-  if (forceFlush) await flushUsage(env, true);
-  let store = emptyUsageStore();
-  let kvBound = !!(env && env.K && typeof env.K.get === 'function');
-  if (kvBound) {
-    try {
-      const raw = await env.K.get(USAGE_KV_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (parsed && parsed.days) store = parsed;
-      }
-    } catch (e) { /* 忽略 */ }
-  }
-  if (_usageBuf) {
-    const day = store.days[_usageBuf.day] || emptyUsageDay(_usageBuf.day);
-    mergeUsageDay(day, _usageBuf);
-    store.days[_usageBuf.day] = day;
-  }
-  return { store, kvBound };
-}
-async function resetUsage(env) {
-  _usageBuf = null;
-  _usageLastPut = 0;
-  if (env && env.K && typeof env.K.delete === 'function') {
-    try { await env.K.delete(USAGE_KV_KEY); } catch (e) { /* 忽略 */ }
-  }
-}
-function clientHashOf(request) {
-  const ip = request.headers.get('CF-Connecting-IP') || '';
-  if (!ip) return '';
-  const fam = classifyClientUA(request.headers.get('User-Agent') || '', '');
-  return md5hex('cfnext|' + ip + '|' + fam).slice(0, 8);
-}
-function makeConnUsage(request, env, protocol) {
-  const colo = (request.cf && request.cf.colo) || '未知';
-  const fam = classifyClientUA(request.headers.get('User-Agent') || '', '');
-  const hash = clientHashOf(request);
-  const client = hash ? (fam + ' · ' + hash) : fam;
-  let bytesIn = 0, bytesOut = 0, started = false, closed = false;
-  return {
-    protocol: protocol || 'vless',
-    outbound: '',
-    addIn(d) { bytesIn += usageByteLen(d); },
-    addOut(d) { bytesOut += usageByteLen(d); },
-    flush(done) {
-      if (closed && !bytesIn && !bytesOut) return;
-      if (!bytesIn && !bytesOut && !done) return;
-      const rec = {
-        reqs: started ? 0 : 1,
-        conns: started ? 0 : 1,
-        bytesIn, bytesOut,
-        protocol: this.protocol,
-        node: colo,
-        outbound: this.outbound,
-        client,
-        clientHash: hash
-      };
-      started = true;
-      bytesIn = 0;
-      bytesOut = 0;
-      if (done) closed = true;
-      noteUsage(env, rec);
-    }
-  };
-}
 function markVia(sock, via) {
   try { if (sock) sock._via = via; } catch (e) { /* 忽略 */ }
   return sock;
@@ -1682,12 +1420,10 @@ async function handleWebSocketProxy(request, cfg, env) {
   // 关键：必须声明二进制类型，否则 CF 将二进制帧按 UTF-8 解码成 string，VLESS/Trojan 头（含 16 字节原始 UUID）会被损坏导致隧道失败
   server.binaryType = 'arraybuffer';
   let socket = null, writer = null, headerSent = false, pending = null;
-  const usage = makeConnUsage(request, env, 'vless');
-  const send = (data) => { usage.addOut(data); try { server.send(data); } catch (e) { /* 忽略 */ } };
+  const send = (data) => { try { server.send(data); } catch (e) { /* 忽略 */ } };
   server.addEventListener('message', async (ev) => {
     try {
       const chunk = typeof ev.data === 'string' ? TE.encode(ev.data) : new Uint8Array(ev.data);
-      usage.addIn(chunk);
       if (!headerSent) {
         // 累积缓冲：Workers 端 WS 消息可能分片到达，不足头部长度时等待后续数据
         pending = pending ? concatBytes(pending, chunk) : chunk;
@@ -1708,7 +1444,6 @@ async function handleWebSocketProxy(request, cfg, env) {
           throw err;
         }
         headerSent = true;
-        usage.protocol = isTrojan ? 'trojan' : 'vless';
         // UDP 请求（command=0x02）：CF Workers 无 UDP socket 无法原生转发数据报，
         // DNS(53) 查询 → DoH(HTTPS) 转换后回标准 DNS 响应（修复 V2rayNG 关闭「本地 DNS」时远端 DNS 不可用）；
         // 其余 UDP 快速失败关闭连接（客户端自动回退），TCP（VLESS/Trojan WS/XHTTP）路径零影响
@@ -1720,46 +1455,39 @@ async function handleWebSocketProxy(request, cfg, env) {
               if (resp) send(resp);
             }
           } catch (e) { /* UDP 处理失败不响应，客户端按超时/回退处理 */ }
-          usage.outbound = 'UDP/DNS';
-          usage.flush(true);
           try { server.close(1000); } catch (e) { /* 忽略 */ }
           return;
         }
         const conn = await openOutbound(parsed, cfg, request.cf && request.cf.colo, isVless);
         socket = conn;
         writer = conn.writable.getWriter();
-        usage.outbound = (conn && conn._via) || '直连';
         // 透明代理：去掉 VLESS/Trojan 头部，发送原始 TLS 数据，由对端按 SNI 路由
         // VLESS 协议：须先向客户端回 2 字节响应头（version=0 + addonsLen=0），否则客户端握手失败
         if (isVless) send(new Uint8Array([0, 0]));
         if (pending && pending.byteLength > parsed.headerLength) await writer.write(pending.subarray(parsed.headerLength));
         pending = null;   // 出站就绪后清空缓冲，后续消息直接写出站
-        pumpToReader(conn.readable.getReader(), send, () => { usage.flush(true); try { server.close(1000); } catch (e) { /* 忽略 */ } });
+        pumpToReader(conn.readable.getReader(), send, () => { try { server.close(1000); } catch (e) { /* 忽略 */ } });
       } else {
         if (writer) await writer.write(chunk); else pending = pending ? concatBytes(pending, chunk) : chunk;   // 出站未就绪时暂存，避免头部之后的早期数据帧被丢弃（否则 TLS 握手不完整 → 连接通但流量为 0）
       }
     } catch (err) {
-      usage.flush(true);
       try { server.close(1011, String(err && err.message || err)); } catch (e) { /* 忽略 */ }
     }
   });
-  const cleanup = () => { usage.flush(true); if (socket) { try { socket.close(); } catch (e) { /* 忽略 */ } socket = null; } };
+  const cleanup = () => { if (socket) { try { socket.close(); } catch (e) { /* 忽略 */ } socket = null; } };
   server.addEventListener('close', cleanup);
   server.addEventListener('error', cleanup);
   return new Response(null, { status: 101, webSocket: client });
 }
 // xhttp 代理（stream-one 模式：请求体即 VLESS 流）
 async function handleXhttpProxy(request, cfg, env) {
-  const usage = makeConnUsage(request, env, 'xhttp');
   const bodyReader = request.body.getReader();
   const first = await bodyReader.read();
   if (first.done) return new Response('empty', { status: 400 });
-  usage.addIn(first.value);
   if (cfg.enableVless === false) return new Response('disabled', { status: 403 });
   if (!vlessUuidMatches(first.value, cfg.uuid)) return new Response('unauthorized', { status: 403 });
   const parsed = parseVlessHeader(first.value);
   const conn = await openOutbound(parsed, cfg, request.cf && request.cf.colo, true);
-  usage.outbound = (conn && conn._via) || '直连';
   const writer = conn.writable.getWriter();
   await writer.write(first.value.subarray(parsed.headerLength));
   (async () => {
@@ -1767,7 +1495,6 @@ async function handleXhttpProxy(request, cfg, env) {
       while (true) {
         const { done, value } = await bodyReader.read();
         if (done) break;
-        usage.addIn(value);
         await writer.write(value);
       }
     } catch (e) { /* 忽略 */ }
@@ -1777,21 +1504,18 @@ async function handleXhttpProxy(request, cfg, env) {
     async start(controller) {
       // 须先回 2 字节 VLESS 响应头（version=0 + addonsLen=0），否则 xhttp 客户端握手失败（真连接报 unexpected response version）
       controller.enqueue(new Uint8Array([0, 0]));
-      usage.addOut(2);
       const r = conn.readable.getReader();
       try {
         while (true) {
           const { done, value } = await r.read();
           if (done) break;
-          usage.addOut(value);
           controller.enqueue(value);
         }
       } catch (e) { /* 忽略 */ }
-      usage.flush(true);
       try { controller.close(); } catch (e) { /* 忽略 */ }
       try { conn.close(); } catch (e) { /* 忽略 */ }
     },
-    cancel() { usage.flush(true); try { conn.close(); } catch (e) { /* 忽略 */ } }
+    cancel() { try { conn.close(); } catch (e) { /* 忽略 */ } }
   });
   return new Response(respStream, { status: 200, headers: { 'content-type': 'application/octet-stream', 'x-accel-buffering': 'no', 'cache-control': 'no-store' } });
 }
@@ -2870,19 +2594,6 @@ pre.code{background:#0b0e14;border:1px solid var(--line);border-radius:8px;paddi
 #qrWrap canvas,#qrWrap img{margin:0 auto}
 .qrbox{background:#fff;display:inline-block;padding:10px;border-radius:8px;margin-top:8px}
 code.hl{background:var(--card2);padding:2px 6px;border-radius:5px;font-family:ui-monospace,Consolas,monospace;font-size:12px}
-.statgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:12px}
-.stat{background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
-.stat .n{font-size:22px;font-weight:700;letter-spacing:-.3px;line-height:1.2}
-.stat .l{font-size:12px;color:var(--dim);margin-top:4px}
-.barrow{display:flex;align-items:center;gap:10px;margin:8px 0}
-.barrow .nm{width:108px;font-size:12px;color:var(--dim);flex:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.barrow .bar{flex:1;height:8px;background:var(--bg);border:1px solid var(--line);border-radius:6px;overflow:hidden}
-.barrow .bar i{display:block;height:100%;background:linear-gradient(90deg,#4f9dff,#6f5bff);border-radius:6px;min-width:2px}
-.barrow .vv{width:118px;text-align:right;font-size:12px;font-family:ui-monospace,Consolas,monospace;color:var(--txt)}
-.hourchart{display:flex;align-items:flex-end;gap:3px;height:128px;padding:10px 0 4px}
-.hourchart b{flex:1;background:linear-gradient(180deg,#4f9dff,#6f5bff);border-radius:3px 3px 0 0;min-height:2px;opacity:.88}
-.hourlbl{display:flex;justify-content:space-between;color:var(--dim);font-size:11px}
-@media(max-width:760px){.statgrid{grid-template-columns:1fr 1fr}}
 </style>
 </head>
 <body>
@@ -2899,7 +2610,6 @@ code.hl{background:var(--card2);padding:2px 6px;border-radius:5px;font-family:ui
   <button data-tab="overview" class="on">总览</button>
   <button data-tab="nodes">节点配置</button>
   <button data-tab="pick">优选器</button>
-  <button data-tab="stats">用量统计</button>
   <button data-tab="help">关于项目</button>
 </nav>
 <!-- 总览 -->
@@ -3171,50 +2881,6 @@ code.hl{background:var(--card2);padding:2px 6px;border-radius:5px;font-family:ui
     </div>
   </div>
 </div>
-<!-- 用量统计 -->
-<div class="tab" id="tab-stats">
-  <div class="card">
-    <h2>用量统计 <span class="tag">聚合计数 · 不记录访问目标</span></h2>
-    <div class="row" style="margin-bottom:8px">
-      <select id="st-range" onchange="loadStats()" style="max-width:200px">
-        <option value="today">今日（北京时间）</option>
-        <option value="7">近 7 天</option>
-        <option value="14" selected>近 14 天</option>
-      </select>
-      <button class="btn sm" onclick="loadStats(true)">刷新</button>
-      <button class="btn sm" onclick="resetStats()">清空统计</button>
-    </div>
-    <p class="hint" id="st-note">加载中…</p>
-    <div class="statgrid" id="st-cards"></div>
-  </div>
-  <div class="card">
-    <h2>24 小时请求 <span class="tag">北京时间 · 所选范围内按小时叠加</span></h2>
-    <div class="hourchart" id="st-hours"></div>
-    <div class="hourlbl"><span>00</span><span>06</span><span>12</span><span>18</span><span>23</span></div>
-  </div>
-  <div class="grid">
-    <div class="card">
-      <h2>按协议</h2>
-      <div id="st-proto"><div class="loading">加载中…</div></div>
-    </div>
-    <div class="card">
-      <h2>按接入节点 <span class="tag">Cloudflare colo</span></h2>
-      <p class="hint">客户端连的是优选 IP / 自定义域名，Worker 只能看到边缘 colo，看不到订阅里的具体节点 IP。</p>
-      <div id="st-node"></div>
-    </div>
-  </div>
-  <div class="grid">
-    <div class="card">
-      <h2>按出站</h2>
-      <div id="st-out"></div>
-    </div>
-    <div class="card">
-      <h2>按客户端 / 订阅格式</h2>
-      <p class="hint">订阅按 UA / 格式归类；代理连接用 UA 族 + IP 短哈希区分，不保存原始 IP。</p>
-      <div id="st-client"></div>
-    </div>
-  </div>
-</div>
 <!-- 关于项目 -->
 <div class="tab" id="tab-help">
   <div class="card">
@@ -3259,8 +2925,6 @@ code.hl{background:var(--card2);padding:2px 6px;border-radius:5px;font-family:ui
       <tr><td>zashboard 管理面板</td><td>https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip</td></tr>
       <tr><td>Qure 图标集</td><td>https://github.com/Koolson/Qure/</td></tr>
       <tr><td>二维码生成库</td><td>https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js</td></tr>
-      <tr><th colspan="2" style="text-align:left">用量统计</th></tr>
-      <tr><td>统计读取 / 清空</td><td><code class="hl">/{UUID}/api/stats</code> GET 读取；POST <code class="hl">?op=reset</code> 仅清空统计</td></tr>
     </table>
   </div>
 </div>
@@ -3310,7 +2974,6 @@ function switchTab(t){
     x.classList.toggle('on', x.id === ('tab-' + t));
   });
   if(t === 'overview') makeSub(false);
-  if(t === 'stats') loadStats();
 }
 document.querySelectorAll('#nav button').forEach(function(b){
   b.addEventListener('click', function(){ switchTab(b.getAttribute('data-tab')); });
@@ -3387,132 +3050,6 @@ function escHtml(s){
   return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
     return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
   });
-}
-function fmtBytes(n){
-  n = Number(n) || 0;
-  if(n < 1024) return n + ' B';
-  if(n < 1048576) return (n/1024).toFixed(1) + ' KB';
-  if(n < 1073741824) return (n/1048576).toFixed(2) + ' MB';
-  return (n/1073741824).toFixed(2) + ' GB';
-}
-function fmtNum(n){
-  n = Number(n) || 0;
-  return n.toLocaleString('zh-CN');
-}
-function emptyStDay(){
-  return { totals:{reqs:0,conns:0,subs:0,bytesIn:0,bytesOut:0}, hourly:Array.from({length:24},function(){ return {reqs:0,bytesIn:0,bytesOut:0}; }), byProtocol:{}, byNode:{}, byOutbound:{}, byClient:{}, clientHashes:[] };
-}
-function mergeStDay(dst, src){
-  if(!src) return dst;
-  var t = dst.totals, s = src.totals || {};
-  t.reqs += s.reqs || 0; t.conns += s.conns || 0; t.subs += s.subs || 0;
-  t.bytesIn += s.bytesIn || 0; t.bytesOut += s.bytesOut || 0;
-  var i, k;
-  for(i=0;i<24;i++){
-    var a = dst.hourly[i], b = (src.hourly && src.hourly[i]) || {};
-    a.reqs += b.reqs || 0; a.bytesIn += b.bytesIn || 0; a.bytesOut += b.bytesOut || 0;
-  }
-  function bump(map, recs){
-    recs = recs || {};
-    for(k in recs){
-      if(!recs.hasOwnProperty(k)) continue;
-      if(!map[k]) map[k] = {reqs:0,conns:0,subs:0,bytesIn:0,bytesOut:0};
-      map[k].reqs += recs[k].reqs || 0;
-      map[k].conns += recs[k].conns || 0;
-      map[k].subs += recs[k].subs || 0;
-      map[k].bytesIn += recs[k].bytesIn || 0;
-      map[k].bytesOut += recs[k].bytesOut || 0;
-    }
-  }
-  bump(dst.byProtocol, src.byProtocol);
-  bump(dst.byNode, src.byNode);
-  bump(dst.byOutbound, src.byOutbound);
-  bump(dst.byClient, src.byClient);
-  var seen = {};
-  (dst.clientHashes || []).forEach(function(h){ seen[h]=1; });
-  (src.clientHashes || []).forEach(function(h){ if(!seen[h]){ dst.clientHashes.push(h); seen[h]=1; } });
-  return dst;
-}
-function pickStatDays(days, range){
-  var keys = Object.keys(days || {}).sort();
-  if(range === 'today'){
-    var now = new Date(Date.now() + 8*3600*1000).toISOString().slice(0,10);
-    return keys.filter(function(k){ return k === now; });
-  }
-  var n = parseInt(range, 10) || 14;
-  return keys.slice(-n);
-}
-function renderBars(el, map, emptyText){
-  var keys = Object.keys(map || {});
-  if(!keys.length){ el.innerHTML = '<p class="hint">' + emptyText + '</p>'; return; }
-  keys.sort(function(a,b){
-    return ((map[b].bytesIn||0)+(map[b].bytesOut||0)+(map[b].reqs||0)) - ((map[a].bytesIn||0)+(map[a].bytesOut||0)+(map[a].reqs||0));
-  });
-  var max = 1;
-  keys.forEach(function(k){
-    var v = (map[k].bytesIn||0)+(map[k].bytesOut||0);
-    if(v > max) max = v;
-    if((map[k].reqs||0) > max) max = map[k].reqs;
-  });
-  var h = '';
-  keys.forEach(function(k){
-    var r = map[k];
-    var bytes = (r.bytesIn||0)+(r.bytesOut||0);
-    var w = Math.max(4, Math.round(100 * (bytes || r.reqs || 0) / max));
-    h += '<div class="barrow"><span class="nm" title="' + escHtml(k) + '">' + escHtml(k) + '</span><span class="bar"><i style="width:' + w + '%"></i></span><span class="vv">' + fmtNum(r.reqs||0) + ' / ' + fmtBytes(bytes) + '</span></div>';
-  });
-  el.innerHTML = h;
-}
-var STATS_CACHE = null;
-function loadStats(force){
-  var note = $('st-note');
-  if(note && !STATS_CACHE) note.textContent = '加载中…';
-  api('stats').then(function(r){
-    if(r && r.status === 403){ location.href = '/login?next=' + encodeURIComponent(APIPATH); return; }
-    if(!r || !r.ok){ if(note) note.textContent = (r && r.msg) || '读取统计失败'; return; }
-    STATS_CACHE = r.data || {};
-    renderStats();
-  }).catch(function(){ if(note) note.textContent = '无法连接服务器'; });
-}
-function renderStats(){
-  var d = STATS_CACHE || {};
-  var range = ($('st-range') && $('st-range').value) || '14';
-  var keys = pickStatDays(d.days || {}, range);
-  var acc = emptyStDay();
-  keys.forEach(function(k){ mergeStDay(acc, d.days[k]); });
-  var t = acc.totals;
-  var bytes = (t.bytesIn||0)+(t.bytesOut||0);
-  var clients = (acc.clientHashes || []).length;
-  var note = [];
-  note.push(d.kvBound ? '已写入 KV 键 usage，留存最近 14 个自然日（北京时间）。' : '未绑定 KV：统计仅存在当前 Worker 隔离体，冷启动后会丢失。');
-  if(d.updatedAt) note.push('最近落盘：' + new Date(d.updatedAt).toLocaleString('zh-CN', { hour12:false }));
-  if(keys.length) note.push('当前范围：' + keys[0] + (keys.length>1 ? (' ~ ' + keys[keys.length-1]) : '') + '（' + keys.length + ' 天）');
-  note.push('流量为进出 Worker 的近似字节（含协议头），不记录访问目标。');
-  $('st-note').textContent = note.join(' ');
-  $('st-cards').innerHTML =
-    '<div class="stat"><div class="n">' + fmtNum(t.reqs) + '</div><div class="l">请求 / 连接</div></div>' +
-    '<div class="stat"><div class="n">' + fmtBytes(bytes) + '</div><div class="l">近似流量（上 ' + fmtBytes(t.bytesIn) + ' / 下 ' + fmtBytes(t.bytesOut) + '）</div></div>' +
-    '<div class="stat"><div class="n">' + fmtNum(t.subs) + '</div><div class="l">订阅拉取</div></div>' +
-    '<div class="stat"><div class="n">' + fmtNum(clients) + '</div><div class="l">去重客户端（短哈希）</div></div>';
-  var maxH = 1;
-  acc.hourly.forEach(function(x){ if((x.reqs||0) > maxH) maxH = x.reqs; });
-  var bars = '';
-  acc.hourly.forEach(function(x, i){
-    var pct = Math.max(2, Math.round(100 * (x.reqs||0) / maxH));
-    bars += '<b title="' + (i<10?'0':'') + i + ':00　' + (x.reqs||0) + ' 次 / ' + fmtBytes((x.bytesIn||0)+(x.bytesOut||0)) + '" style="height:' + pct + '%"></b>';
-  });
-  $('st-hours').innerHTML = bars;
-  renderBars($('st-proto'), acc.byProtocol, '暂无协议数据（有代理或订阅请求后出现）');
-  renderBars($('st-node'), acc.byNode, '暂无接入节点数据');
-  renderBars($('st-out'), acc.byOutbound, '暂无出站数据（仅代理连接记录）');
-  renderBars($('st-client'), acc.byClient, '暂无客户端数据');
-}
-function resetStats(){
-  if(!confirm('确定清空用量统计？不影响面板配置与节点。')) return;
-  fetch(APIPATH + '/api/stats?op=reset', { method:'POST' }).then(function(r){ return r.json(); }).then(function(r){
-    if(r && r.ok){ toast(r.msg || '已清空', 'ok'); STATS_CACHE = { days:{}, kvBound:true }; renderStats(); }
-    else toast((r && r.msg) || '清空失败', 'err');
-  }).catch(function(){ toast('清空失败：无法连接服务器', 'err'); });
 }
 function onNodeLimit(){
   var on = $('f-nodeLimit') && $('f-nodeLimit').value === 'true';
@@ -3661,7 +3198,7 @@ function saveAll(){
 }
 // 重置：清空 KV 中全部数据（面板配置 + 已下发节点记录），面板还原为最开始的部署状态
 function resetAll(){
-  if(!confirm('确定重置？将清空 KV 中全部面板配置、节点记录与用量统计，面板还原为最开始的部署状态。此操作不可恢复！')) return;
+  if(!confirm('确定重置？将清空 KV 中全部面板配置与节点记录，面板还原为最开始的部署状态。此操作不可恢复！')) return;
   var btn = $('resetBtn');
   btn.disabled = true;
   api('reset', { method: 'POST' })
@@ -4017,15 +3554,6 @@ async function handleRequest(request, env) {
         const win = [...new Set([...sub.issued, ...prevIps])].slice(0, 200);
         scheduleIssuedPut(env, win);
       }
-      noteUsage(env, {
-        reqs: 1,
-        subs: 1,
-        bytesOut: TE.encode(sub.body || '').byteLength,
-        protocol: '订阅',
-        node: (request.cf && request.cf.colo) || '未知',
-        client: classifyClientUA(UA, sub.format),
-        clientHash: clientHashOf(request)
-      });
       return new Response(sub.body, { status: 200, headers: { 'Content-Type': sub.type + '; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Disposition': 'attachment; filename*=utf-8\'\'CFNext' } });
     } catch (e) {
       return new Response('订阅生成失败: ' + (e && e.message || e), { status: 500, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
@@ -4070,23 +3598,8 @@ async function handleRequest(request, env) {
         invalidateConfigCache();
         _issuedLastPut = 0;
         _issuedLastIps = '';
-        await resetUsage(env);
         return json({ ok: true, msg: '已重置：KV 已清空，面板还原为初始部署状态' });
       } catch (e) { return json({ ok: false, msg: '重置失败: ' + (e.message || e) }, 500); }
-    }
-    if (apiName === 'stats') {
-      if (request.method === 'DELETE' || (request.method === 'POST' && url.searchParams.get('op') === 'reset')) {
-        await resetUsage(env);
-        return json({ ok: true, msg: '已清空用量统计' });
-      }
-      try {
-        // 不再每次打开统计页都强制 put：隔离体缓冲会合并进响应；脏缓冲且距上次写入 >15s 才落盘
-        if (usageBufHasData(_usageBuf) && (!_usageLastPut || (Date.now() - _usageLastPut) > 15000)) {
-          await flushUsage(env, true);
-        }
-        const { store, kvBound } = await readUsage(env, false);
-        return json({ ok: true, data: { v: store.v || 1, updatedAt: store.updatedAt || Date.now(), days: store.days || {}, kvBound, tz: 'UTC+8' } });
-      } catch (e) { return json({ ok: false, msg: '读取统计失败: ' + (e.message || e) }, 500); }
     }
     if (apiName === 'status') {
       return json({ ok: true, data: { version: VERSION, host: url.hostname, path: panelPath, region: (request.cf && request.cf.colo) || 'unknown' } });
