@@ -794,7 +794,14 @@ function json(obj, status) {
 // ---------------------------------------------------------------------------
 // 配置加载：默认值 < 环境变量 < KV 图形化配置
 // ---------------------------------------------------------------------------
-async function loadConfig(env) {
+// 隔离体内短缓存：同一 Worker 实例上避免每个 404 / WS / 订阅都打一次 KV 读。
+// 面板保存 / 重置后必须失效。cacheTtl 让边缘再缓存 60s（KV 最小值），跨隔离体读也会少计一次。
+let _cfgCache = null, _cfgCacheAt = 0;
+const CONFIG_CACHE_MS = 30000;
+function invalidateConfigCache() { _cfgCache = null; _cfgCacheAt = 0; }
+async function loadConfig(env, opts) {
+  const force = opts && typeof opts === 'object' && opts.force;
+  if (!force && _cfgCache && (Date.now() - _cfgCacheAt) < CONFIG_CACHE_MS) return _cfgCache;
   const cfg = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
   // 环境变量
   if (env.U) cfg.uuid = String(env.U).toLowerCase();
@@ -812,7 +819,7 @@ async function loadConfig(env) {
   // KV 图形化配置（更高优先级）
   if (env.K && typeof env.K.get === 'function') {
     try {
-      const kvJson = await env.K.get('config');
+      const kvJson = await env.K.get('config', { cacheTtl: 60 });
       if (kvJson) {
         const kvCfg = JSON.parse(kvJson);
         Object.assign(cfg, kvCfg);
@@ -833,6 +840,8 @@ async function loadConfig(env) {
   // 若 KV 残留 "/"（旧配置/面板填写），订阅 ws 路径与 Worker 路由不匹配会导致 CF 边缘 302/404、客户端全 -1
   if (!cfg.path || cfg.path === '/' || cfg.path === '') cfg.path = cfg.uuid;
   if (!Array.isArray(cfg.preferredIPs)) cfg.preferredIPs = parseIPList(cfg.preferredIPs);
+  _cfgCache = cfg;
+  _cfgCacheAt = Date.now();
   return cfg;
 }
 async function saveConfig(env, cfg) {
@@ -840,6 +849,7 @@ async function saveConfig(env, cfg) {
   const clone = JSON.parse(JSON.stringify(cfg));
   if (clone.admin) clone.admin = String(clone.admin);
   await env.K.put('config', JSON.stringify(clone));
+  invalidateConfigCache();
   return true;
 }
 // ---------------------------------------------------------------------------
@@ -851,6 +861,12 @@ const USAGE_KV_KEY = 'usage';
 const USAGE_DAYS = 14;
 const USAGE_TOP = 24;
 const USAGE_MIN_FLUSH_MS = 90000;
+// 轮询键 issued：每个订阅拉取都 put 会打满免费 KV 每日 1000 次写入。
+// 与 usage 一样按隔离体节流；窗口 IP 未变化则完全跳过写入。
+const ISSUED_KV_KEY = 'issued';
+const ISSUED_MIN_PUT_MS = 90000;
+let _issuedLastPut = 0;
+let _issuedLastIps = '';
 const USAGE_TZ_MS = 8 * 3600 * 1000;   // 按北京时间（UTC+8）切日
 let _usageBuf = null;
 let _usageLastPut = 0;
@@ -1127,6 +1143,26 @@ function readAddress(data, view, offset, atyp) {
     return { addr: formatIPv6(bytes), len: 16 };
   }
   throw new Error('无法识别的地址类型');
+}
+// VLESS UUID 比对：路径 token 仍是入口鉴权，但协议头里的 16 字节 UUID 也必须匹配，
+// 避免「只知道自定义 path、不知道 UUID」时把 Worker 当开源代理。
+function uuidToBytes(u) {
+  const hex = String(u || '').replace(/-/g, '').toLowerCase();
+  if (hex.length !== 32) return null;
+  const out = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) {
+    const n = parseInt(hex.substr(i * 2, 2), 16);
+    if (Number.isNaN(n)) return null;
+    out[i] = n;
+  }
+  return out;
+}
+function vlessUuidMatches(data, uuid) {
+  const want = uuidToBytes(uuid);
+  if (!want || !data || data.byteLength < 17) return false;
+  let diff = 0;
+  for (let i = 0; i < 16; i++) diff |= data[1 + i] ^ want[i];
+  return diff === 0;
 }
 // VLESS 请求头：Version(1) | UUID(16) | AddonsLen(1) | Addons | Cmd(1) | Port(2) | Atyp(1) | Addr | [TCP]1字节User | [UDP]数据包
 function parseVlessHeader(data) {
@@ -1664,6 +1700,9 @@ async function handleWebSocketProxy(request, cfg, env) {
           if (!isTrojan && pending.byteLength > 0 && pending[0] !== 0 && pending.byteLength < 58) return;
           isVless = !isTrojan;
           parsed = isTrojan ? parseTrojanHeader(pending) : parseVlessHeader(pending);
+          if (isTrojan && cfg.enableTrojan === false) throw new Error('Trojan 未启用');
+          if (isVless && cfg.enableVless === false) throw new Error('VLESS 未启用');
+          if (isVless && !vlessUuidMatches(pending, cfg.uuid)) throw new Error('UUID 不匹配');
         } catch (err) {
           if (/头部过短/.test(err.message || '')) return;   // 等下一个分片
           throw err;
@@ -1716,6 +1755,8 @@ async function handleXhttpProxy(request, cfg, env) {
   const first = await bodyReader.read();
   if (first.done) return new Response('empty', { status: 400 });
   usage.addIn(first.value);
+  if (cfg.enableVless === false) return new Response('disabled', { status: 403 });
+  if (!vlessUuidMatches(first.value, cfg.uuid)) return new Response('unauthorized', { status: 403 });
   const parsed = parseVlessHeader(first.value);
   const conn = await openOutbound(parsed, cfg, request.cf && request.cf.colo, true);
   usage.outbound = (conn && conn._via) || '直连';
@@ -3336,11 +3377,16 @@ function copyCode(t){
 }
 function renderStatus(d){
   var h = '';
-  h += '<div class="kv"><span class="k">Worker 地址</span><span class="v">' + (d.host || '') + '</span></div>';
-  h += '<div class="kv"><span class="k">面板路径</span><span class="v">' + (d.path || '') + '</span></div>';
-  h += '<div class="kv"><span class="k">面板入口</span><span class="v">' + location.origin + '/' + (d.path || '') + '</span></div>';
+  h += '<div class="kv"><span class="k">Worker 地址</span><span class="v">' + escHtml(d.host || '') + '</span></div>';
+  h += '<div class="kv"><span class="k">面板路径</span><span class="v">' + escHtml(d.path || '') + '</span></div>';
+  h += '<div class="kv"><span class="k">面板入口</span><span class="v">' + escHtml(location.origin + '/' + (d.path || '')) + '</span></div>';
   h += '<div class="kv"><span class="k">接入节点</span><span class="v">' + (d.host ? '正常' : '未知') + '</span></div>';
   $('statusBox').innerHTML = h;
+}
+function escHtml(s){
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
+    return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+  });
 }
 function fmtBytes(n){
   n = Number(n) || 0;
@@ -3413,7 +3459,7 @@ function renderBars(el, map, emptyText){
     var r = map[k];
     var bytes = (r.bytesIn||0)+(r.bytesOut||0);
     var w = Math.max(4, Math.round(100 * (bytes || r.reqs || 0) / max));
-    h += '<div class="barrow"><span class="nm" title="' + k + '">' + k + '</span><span class="bar"><i style="width:' + w + '%"></i></span><span class="vv">' + fmtNum(r.reqs||0) + ' / ' + fmtBytes(bytes) + '</span></div>';
+    h += '<div class="barrow"><span class="nm" title="' + escHtml(k) + '">' + escHtml(k) + '</span><span class="bar"><i style="width:' + w + '%"></i></span><span class="vv">' + fmtNum(r.reqs||0) + ' / ' + fmtBytes(bytes) + '</span></div>';
   });
   el.innerHTML = h;
 }
@@ -3844,14 +3890,16 @@ button{width:100%;background:#4f9dff;border:none;color:#fff;border-radius:8px;pa
   </form>
 </div>
 <script>
-var next = new URLSearchParams(location.search).get('next') || '/';
+var nextRaw = new URLSearchParams(location.search).get('next') || '/';
+var next = (nextRaw.charAt(0) === '/' && nextRaw.charAt(1) !== '/') ? nextRaw : '/';
 document.getElementById('form').addEventListener('submit', function(e){
   e.preventDefault();
   var pwd = document.getElementById('pwd').value;
   fetch('/login', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'password=' + encodeURIComponent(pwd) + '&next=' + encodeURIComponent(next) })
     .then(function(r){ return r.json(); })
     .then(function(r){
-      if(r && r.ok){ location.href = r.next || '/'; }
+      var go = (r && r.next && r.next.charAt(0) === '/' && r.next.charAt(1) !== '/') ? r.next : '/';
+      if(r && r.ok){ location.href = go; }
       else { document.getElementById('msg').style.display = 'block'; }
     })
     .catch(function(){ document.getElementById('msg').textContent = '网络错误'; document.getElementById('msg').style.display = 'block'; });
@@ -3872,6 +3920,27 @@ async function requireAuth(request, cfg) {
   const m = cookies.match(/(?:^|;\s*)luma_auth=([^;]+)/);
   return !!(m && m[1] === md5hex(String(cfg.admin)));
 }
+// 登录回跳只允许站内相对路径，避免 ?next=https://evil 开放重定向
+function safeNextPath(raw, fallback) {
+  const n = String(raw || '');
+  if (!n.startsWith('/') || n.startsWith('//') || n.includes('://') || n.includes('\\') || /[\0\r\n]/.test(n)) {
+    return fallback || '/';
+  }
+  return n;
+}
+function scheduleIssuedPut(env, win) {
+  if (!env || !env.K || typeof env.K.put !== 'function' || !win || !win.length) return;
+  const ipsKey = win.join(',');
+  const now = Date.now();
+  if (ipsKey === _issuedLastIps) return;
+  if (_issuedLastPut && (now - _issuedLastPut) < ISSUED_MIN_PUT_MS) return;
+  _issuedLastIps = ipsKey;
+  _issuedLastPut = now;
+  const payload = JSON.stringify({ t: now, ips: win });
+  const run = () => env.K.put(ISSUED_KV_KEY, payload).catch(() => {});
+  if (env._ctx && typeof env._ctx.waitUntil === 'function') env._ctx.waitUntil(run());
+  else run();
+}
 async function handleRequest(request, env) {
   const url = new URL(request.url);
   const UA = request.headers.get('User-Agent') || '';
@@ -3880,14 +3949,14 @@ async function handleRequest(request, env) {
   if (url.protocol === 'http:') {
     return Response.redirect(url.href.replace('http://', 'https://'), 301);
   }
-  const cfg = await loadConfig(env);
-  const panelPath = cfg.path || cfg.uuid;
   const path = url.pathname.replace(/^\/+|\/+$/g, '');
   const segs = path.split('/');
-  // ---------- 版本接口 ----------
+  // ---------- 版本接口（无需读 KV） ----------
   if (segs[0] === 'version') {
     return json({ version: VERSION });
   }
+  const cfg = await loadConfig(env);
+  const panelPath = cfg.path || cfg.uuid;
   // ---------- 登录 ----------
   if (segs[0] === 'login') {
     if (request.method === 'POST') {
@@ -3895,7 +3964,8 @@ async function handleRequest(request, env) {
       const params = new URLSearchParams(body);
       if (params.get('password') === cfg.admin) {
         const token = md5hex(String(cfg.admin));
-        return new Response(JSON.stringify({ ok: true, next: params.get('next') || '/' }), {
+        const next = safeNextPath(params.get('next'), '/' + panelPath);
+        return new Response(JSON.stringify({ ok: true, next }), {
           status: 200,
           headers: {
             'Content-Type': 'application/json; charset=utf-8',
@@ -3935,19 +4005,17 @@ async function handleRequest(request, env) {
       let skip = null;
       if (cfg.polling !== false && env.K && typeof env.K.get === 'function') {
         try {
-          const iv = await env.K.get('issued');
+          const iv = await env.K.get(ISSUED_KV_KEY, { cacheTtl: 60 });
           if (iv) { const j = JSON.parse(iv); if (Array.isArray(j.ips) && j.ips.length) skip = new Set(j.ips); }
         } catch (e) { /* 忽略 */ }
       }
       const sub = await generateSubscription(skip ? Object.assign({}, cfg, { _skipIssued: skip }) : cfg, request.url, fmt, UA, request.cf && request.cf.colo);
       if (cfg.polling !== false && env.K && typeof env.K.put === 'function' && sub.issued && sub.issued.length) {
-        // 滑动窗口历史队列：合并历史与本次已下发 IP，去重后保留最近 200 条（新 IP 优先保留），
-        // 既实现客户端定期换新 IP，又避免集合无限增长或清空引起数量塌陷
+        // 滑动窗口历史队列：合并历史与本次已下发 IP，去重后保留最近 200 条（新 IP 优先保留）。
+        // 写入节流：窗口未变或距上次 put < 90s 则跳过，避免每个客户端刷新订阅都计一次免费 KV 写。
         const prevIps = skip ? Array.from(skip) : [];
         const win = [...new Set([...sub.issued, ...prevIps])].slice(0, 200);
-        const payload = JSON.stringify({ t: Date.now(), ips: win });
-        if (env._ctx && typeof env._ctx.waitUntil === 'function') env._ctx.waitUntil(env.K.put('issued', payload).catch(() => {}));
-        else await env.K.put('issued', payload).catch(() => {});
+        scheduleIssuedPut(env, win);
       }
       noteUsage(env, {
         reqs: 1,
@@ -3988,7 +4056,7 @@ async function handleRequest(request, env) {
           if (body.optimizer && typeof body.optimizer === 'object') merged.optimizer = Object.assign(merged.optimizer, body.optimizer);
           if (body.preferredIPs && Array.isArray(body.preferredIPs)) merged.preferredIPs = body.preferredIPs;
           await saveConfig(env, merged);
-          const fresh = await loadConfig(env, request.url);
+          const fresh = await loadConfig(env, { force: true });
           return json({ ok: true, data: Object.assign({}, fresh, { version: VERSION }), msg: '已保存并生效' });
         } catch (e) { return json({ ok: false, msg: '保存失败: ' + (e.message || e) }, 500); }
       }
@@ -3998,7 +4066,10 @@ async function handleRequest(request, env) {
       try {
         if (!env.K || typeof env.K.delete !== 'function') return json({ ok: false, msg: '未绑定 KV 命名空间，无需重置' }, 400);
         await env.K.delete('config');
-        await env.K.delete('issued');
+        await env.K.delete(ISSUED_KV_KEY);
+        invalidateConfigCache();
+        _issuedLastPut = 0;
+        _issuedLastIps = '';
         await resetUsage(env);
         return json({ ok: true, msg: '已重置：KV 已清空，面板还原为初始部署状态' });
       } catch (e) { return json({ ok: false, msg: '重置失败: ' + (e.message || e) }, 500); }
@@ -4009,7 +4080,11 @@ async function handleRequest(request, env) {
         return json({ ok: true, msg: '已清空用量统计' });
       }
       try {
-        const { store, kvBound } = await readUsage(env, true);
+        // 不再每次打开统计页都强制 put：隔离体缓冲会合并进响应；脏缓冲且距上次写入 >15s 才落盘
+        if (usageBufHasData(_usageBuf) && (!_usageLastPut || (Date.now() - _usageLastPut) > 15000)) {
+          await flushUsage(env, true);
+        }
+        const { store, kvBound } = await readUsage(env, false);
         return json({ ok: true, data: { v: store.v || 1, updatedAt: store.updatedAt || Date.now(), days: store.days || {}, kvBound, tz: 'UTC+8' } });
       } catch (e) { return json({ ok: false, msg: '读取统计失败: ' + (e.message || e) }, 500); }
     }
