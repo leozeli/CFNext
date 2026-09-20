@@ -4,13 +4,13 @@
 //  环境变量：
 //    U            VLESS UUID（必填，同时用作面板访问路径，除非设置了 D）
 //    D / PATH     自定义面板路径（可选）
-//    ADMIN        面板管理密码（可选，设置后访问面板需登录）
+//    ADMIN        面板管理密码（可选，设置后访问面板需登录；设置后不可被面板 POST / KV 覆盖）
 //    HOST         自定义 SNI/Host（可选，默认使用 Worker 域名）
 //    PROXYIP      自定义反代/落地 IP（可选，留空使用内置地区反代，格式 host 或 host:port）
-//    S / OUTBOUND 出站代理（可选，socks5:// / http:// 或 host:port）
+//    S / OUTBOUND 出站代理（可选，socks5:// / http:// 或 host:port；设置后不可被面板 POST / KV 覆盖）
 //    ECH          设为 true/1 开启 ECH 加密（可选）
 //    TROJAN       设为 true/1 开启 Trojan 协议（已支持 Clash Verge / Mihomo，自动下发 sni 字段；V2rayNG 亦可使用）
-//    TROJAN_PASSWORD  Trojan 密码（开启 Trojan 时必填）
+//    TROJAN_PASSWORD  Trojan 密码（开启 Trojan 时必填；设置后不可被面板 POST / KV 覆盖）
 //    ALPN         自定义 ALPN 协商（可选）
 //    YX           自定义优选 IP 列表（可选，格式 IP:port#名称，逗号分隔）
 //    YXURL        优选器自定义数据源 URL（可选）
@@ -18,9 +18,9 @@
 //    K            已绑定 KV 命名空间时读取图形化配置（config / issued）
 // ============================================================================
 import { connect } from 'cloudflare:sockets';
-const VERSION = '1.0.6';
-// GitHub 仓库最新版源码地址（面板右上角版本号按钮点击检测更新；远端版本号取自该文件 const VERSION）
-const UPDATE_RAW_URL = 'https://raw.githubusercontent.com/PAICNI/CFNext/main/CFNext%20%E6%98%8E%E6%96%87%E7%89%88.js';
+const VERSION = '1.0.7';
+// 本仓库明文版（leozeli/CFNext main）：面板只对比 VERSION，不回传整份源码供一键粘贴
+const UPDATE_RAW_URL = 'https://raw.githubusercontent.com/leozeli/CFNext/main/CFNext%20%E6%98%8E%E6%96%87%E7%89%88.js';
 const CLASH_TEMPLATE = `# ==================== 锚点配置 ====================
 # 代理提供者模板 - 订阅源基础配置
 
@@ -33,16 +33,15 @@ FilterUS: &FilterUS '^(?=.*(?i)(美|🇺🇸|US|USA|JFK|SJC|LAX|ORD|ATL|DFW|SFO|
 FilterTW: &FilterTW '^(?=.*(?i)(台|🇹🇼|TW|tai|TPE|TSA|KHH))(?!.*5x).*$'
 
 # ==================== 监听器 ====================
+# 入站仅绑定本机，避免订阅导入后默认对局域网暴露 SS / mixed 端口
 listeners:
-  # Shadowsocks监听器 - 远程连接家庭网络，端口和密码使用时请修改（默认密码请勿用于公网）
-  - {name: SS-IN,  type: shadowsocks, listen: '::', port: 10000, udp: true, password: Xf3#Lp9WqZ, cipher: aes-256-gcm}
-  # Mixed监听器 - 分地区专用端口 玩法：本地浏览器插件或手机APP配置代理，实现分地区访问
-  - {name: MIXED-SG, type: mixed, port: 50000, proxy: 新加坡节点}
-  - {name: MIXED-US, type: mixed, port: 50001, proxy: 美国节点}
-  - {name: MIXED-TW, type: mixed, port: 50002, proxy: 台湾节点}
-  - {name: MIXED-HK, type: mixed, port: 50003, proxy: 香港节点}
-  - {name: MIXED-JP, type: mixed, port: 50004, proxy: 日本节点}
-  - {name: MIXED-AL, type: mixed, port: 50007, proxy: 一键连接}
+  - {name: SS-IN,  type: shadowsocks, listen: 127.0.0.1, port: 10000, udp: true, password: __CLASH_SECRET__, cipher: aes-256-gcm}
+  - {name: MIXED-SG, type: mixed, listen: 127.0.0.1, port: 50000, proxy: 新加坡节点}
+  - {name: MIXED-US, type: mixed, listen: 127.0.0.1, port: 50001, proxy: 美国节点}
+  - {name: MIXED-TW, type: mixed, listen: 127.0.0.1, port: 50002, proxy: 台湾节点}
+  - {name: MIXED-HK, type: mixed, listen: 127.0.0.1, port: 50003, proxy: 香港节点}
+  - {name: MIXED-JP, type: mixed, listen: 127.0.0.1, port: 50004, proxy: 日本节点}
+  - {name: MIXED-AL, type: mixed, listen: 127.0.0.1, port: 50007, proxy: 一键连接}
 
 # ==================== 核心配置 ====================
 mode: rule
@@ -52,22 +51,19 @@ redir-port: 7892
 mixed-port: 7893
 tproxy-port: 7895
 ipv6: true
-allow-lan: true
+allow-lan: false
 unified-delay: true
 tcp-concurrent: true
 log-level: warning
-bind-address: '*'
+bind-address: 127.0.0.1
 find-process-mode: 'always'
 keep-alive-interval: 15
 keep-alive-idle: 600
 
-# 认证配置（默认凭据请务必修改！）
+# 认证配置：密钥由 Worker 按 UUID 派生（sha224(uuid|cfnext-clash-ctl) 前 24 位 hex），每个部署不同
 authentication:
-  - mihomo:yyds666
+  - mihomo:__CLASH_SECRET__
 skip-auth-prefixes:
-  - 192.168.1.0/24
-  - 192.168.31.0/24
-  - 192.168.100.0/24
   - 127.0.0.1/8
 
 # 实验性功能
@@ -79,7 +75,7 @@ external-ui-url: https://github.com/Zephyruso/zashboard/releases/latest/download
 external-ui-name: zashboard
 external-ui: ui
 external-controller: 127.0.0.1:9090
-secret: yyds666    # 请修改为自定义密钥
+secret: __CLASH_SECRET__
 # 允许网页面板跨域访问
 external-controller-cors:
   allow-origins:
@@ -792,7 +788,84 @@ function json(obj, status) {
   return new Response(JSON.stringify(obj), { status: status || 200, headers: { 'Content-Type': 'application/json; charset=utf-8' } });
 }
 // ---------------------------------------------------------------------------
-// 配置加载：默认值 < 环境变量 < KV 图形化配置
+// 配置 API：GET 脱敏 + POST 白名单。未知键忽略；环境变量强制的密钥不可被面板 POST / KV 覆盖。
+// ---------------------------------------------------------------------------
+const SECRET_MASK = '********';
+const CONFIG_SCALAR_KEYS = [
+  'uuid', 'path', 'host', 'alpn', 'ech', 'echHost', 'echDns', 'tlsOnly',
+  'nodeLimit', 'nodeLimitCount', 'polling',
+  'enableVless', 'enableTrojan', 'enableXhttp',
+  'proxyIP', 'outboundMode', 'preferredDomains'
+];
+const CONFIG_SECRET_KEYS = ['admin', 'trojanPassword', 'outboundProxy'];
+const OPTIMIZER_KEYS = ['source', 'sourceURL', 'port', 'threads', 'count', 'useCidr', 'fillCount', 'subMode', 'subRandomCount', 'subIncludeDefault'];
+const FILTER_KEYS = ['region', 'ipType', 'isp'];
+function envSecretLocks(env) {
+  return {
+    admin: !!(env && (env.ADMIN || env.admin)),
+    trojanPassword: !!(env && env.TROJAN_PASSWORD),
+    outboundProxy: !!(env && (env.S || env.OUTBOUND))
+  };
+}
+function applyEnvForcedSecrets(cfg, env) {
+  if (!cfg || !env) return;
+  if (env.ADMIN || env.admin) cfg.admin = String(env.ADMIN || env.admin);
+  if (env.TROJAN_PASSWORD) cfg.trojanPassword = String(env.TROJAN_PASSWORD);
+  if (env.S || env.OUTBOUND) cfg.outboundProxy = String(env.S || env.OUTBOUND);
+}
+function redactOutboundProxy(raw) {
+  const s = String(raw || '');
+  if (!s) return '';
+  if (/\/\/[^/?#]*@/.test(s)) return s.replace(/\/\/[^/?#]*@/, '//' + SECRET_MASK + '@');
+  if (/^[^:/?#]+:[^@/?#]*@/.test(s)) return SECRET_MASK + '@' + s.slice(s.indexOf('@') + 1);
+  return s;
+}
+function isMaskedSecret(v) {
+  const s = String(v == null ? '' : v);
+  return s === SECRET_MASK || s.indexOf(SECRET_MASK) >= 0;
+}
+function pickKnown(src, keys) {
+  const out = {};
+  if (!src || typeof src !== 'object') return out;
+  for (const k of keys) {
+    if (Object.prototype.hasOwnProperty.call(src, k) && src[k] !== undefined) out[k] = src[k];
+  }
+  return out;
+}
+function applyConfigPatch(base, body, env) {
+  const merged = JSON.parse(JSON.stringify(base || {}));
+  const locks = envSecretLocks(env);
+  Object.assign(merged, pickKnown(body, CONFIG_SCALAR_KEYS));
+  if (body && typeof body.optimizer === 'object' && body.optimizer) {
+    merged.optimizer = Object.assign({}, merged.optimizer || {}, pickKnown(body.optimizer, OPTIMIZER_KEYS));
+  }
+  if (body && typeof body.filter === 'object' && body.filter) {
+    merged.filter = Object.assign({}, merged.filter || {}, pickKnown(body.filter, FILTER_KEYS));
+  }
+  if (body && Array.isArray(body.preferredIPs)) merged.preferredIPs = body.preferredIPs;
+  for (const k of CONFIG_SECRET_KEYS) {
+    if (locks[k]) continue;
+    if (!body || !Object.prototype.hasOwnProperty.call(body, k)) continue;
+    if (isMaskedSecret(body[k])) continue;
+    merged[k] = body[k];
+  }
+  applyEnvForcedSecrets(merged, env);
+  return merged;
+}
+function redactConfigForClient(cfg, env) {
+  const out = JSON.parse(JSON.stringify(cfg || {}));
+  delete out.fragment;
+  delete out.fragmentParam;
+  delete out._skipIssued;
+  if (out.admin) out.admin = SECRET_MASK;
+  if (out.trojanPassword) out.trojanPassword = SECRET_MASK;
+  if (out.outboundProxy) out.outboundProxy = redactOutboundProxy(out.outboundProxy);
+  out.version = VERSION;
+  out.secretLocks = envSecretLocks(env);
+  return out;
+}
+// ---------------------------------------------------------------------------
+// 配置加载：默认值 < 环境变量 < KV 图形化配置；admin / trojanPassword / outboundProxy 以环境变量为准
 // ---------------------------------------------------------------------------
 // 隔离体内短缓存：同一 Worker 实例上避免每个 404 / WS / 订阅都打一次 KV 读。
 // 面板保存 / 重置后必须失效。cacheTtl 让边缘再缓存 60s（KV 最小值），跨隔离体读也会少计一次。
@@ -822,17 +895,16 @@ async function loadConfig(env, opts) {
       const kvJson = await env.K.get('config', { cacheTtl: 60 });
       if (kvJson) {
         const kvCfg = JSON.parse(kvJson);
-        Object.assign(cfg, kvCfg);
-        if (kvCfg.optimizer) cfg.optimizer = Object.assign(JSON.parse(JSON.stringify(DEFAULT_CONFIG.optimizer)), kvCfg.optimizer);
+        Object.assign(cfg, applyConfigPatch(cfg, kvCfg, env));
+        if (kvCfg.optimizer) cfg.optimizer = Object.assign(JSON.parse(JSON.stringify(DEFAULT_CONFIG.optimizer)), pickKnown(kvCfg.optimizer, OPTIMIZER_KEYS));
         if (kvCfg.preferredIPs && Array.isArray(kvCfg.preferredIPs)) cfg.preferredIPs = kvCfg.preferredIPs;
-        if (kvCfg.admin) cfg.admin = String(kvCfg.admin);
-        if (kvCfg.uuid) cfg.uuid = String(kvCfg.uuid).toLowerCase();
       }
     } catch (e) { /* KV 读取失败忽略 */ }
   }
   // 清理已废弃字段（fragment 分片功能已移除，避免 KV 残留字段混入配置）
   delete cfg.fragment;
   delete cfg.fragmentParam;
+  applyEnvForcedSecrets(cfg, env);
   // 兜底
   cfg.uuid = String(cfg.uuid || '').toLowerCase();
   if (!isUUID(cfg.uuid)) cfg.uuid = uuidv4();
@@ -847,7 +919,14 @@ async function loadConfig(env, opts) {
 async function saveConfig(env, cfg) {
   if (!env.K || typeof env.K.put !== 'function') return false;
   const clone = JSON.parse(JSON.stringify(cfg));
+  const locks = envSecretLocks(env);
+  if (locks.admin) delete clone.admin;
+  if (locks.trojanPassword) delete clone.trojanPassword;
+  if (locks.outboundProxy) delete clone.outboundProxy;
   if (clone.admin) clone.admin = String(clone.admin);
+  delete clone.version;
+  delete clone.secretLocks;
+  delete clone._skipIssued;
   await env.K.put('config', JSON.stringify(clone));
   invalidateConfigCache();
   return true;
@@ -1010,50 +1089,56 @@ function trojanPasswordHash(pass) {
   if (pass !== _trojanPassC) { _trojanPassC = pass; _trojanHashC = sha224hex(pass); }
   return _trojanHashC;
 }
-// Trojan 判定：主判定 SHA224(密码) 的 56 字节 hex 精确匹配（与节点生成同源，密码留空用 UUID）；
-// 兜底判定对齐 edgetunnel/_worker 方案：前 56 字节全为 hex 字符且 56/57 为 CRLF 即按 Trojan 处理，
-// 兼容客户端密码变体/大小写差异（该 Worker 仅依赖 path token 鉴权）；VLESS 头 version=0x00 + 16 字节 UUID
-// 必含非 hex 字节且无尾部 CRLF，不会误判，VLESS/XHTTP 行为不受影响
+// Trojan 判定：仅 SHA224(密码) 的 56 字节 hex 精确匹配（与节点生成同源，密码留空用 UUID）。
+// 已移除「任意 56 hex + CRLF ⇒ Trojan」兼容兜底：错误密码不再被当成 Trojan。
+// VLESS 头 version=0x00 + 16 字节 UUID，不会与 SHA224 hex 碰撞，VLESS/XHTTP 不受影响。
 function detectTrojan(pending, cfg) {
-  if (!cfg.enableTrojan || !pending || pending.byteLength < 58) return false;
+  if (!cfg.enableTrojan || !pending || pending.byteLength < 56) return false;
   const head = pending.subarray(0, 56);
-  if (TD.decode(head).toLowerCase() === trojanPasswordHash(cfg.trojanPassword || cfg.uuid)) return true;
-  if (pending[56] === 0x0d && pending[57] === 0x0a) {
-    for (let i = 0; i < 56; i++) {
-      const c = head[i];
-      if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70))) return false;
-    }
-    return true;
-  }
-  return false;
+  return TD.decode(head).toLowerCase() === trojanPasswordHash(cfg.trojanPassword || cfg.uuid);
 }
 // ---------------------------------------------------------------------------
 // 出站连接：直连 / SOCKS5 / HTTP CONNECT / 反代 IP 中继
 // ---------------------------------------------------------------------------
-async function connectDirect(target, timeoutMs) {
-  const socket = connect({ hostname: target.hostname, port: target.port });
-  // 连接超时保护：目标 SYN 被静默丢弃（CF 回环保护 / 不可达）时不再无限挂起，及时进入反代兜底
+const OUTBOUND_DIRECT_MS = 2500;
+const OUTBOUND_RELAY_MS = 2500;
+const OUTBOUND_PROXY_MS = 3000;
+const RELAY_REGION_LIMIT = 2;
+const RELAY_TARGET_LIMIT = 2;
+async function raceTimeout(promise, ms, onTimeout, msg) {
   let timer = null;
-  const timerP = new Promise((_, reject) => {
-    timer = setTimeout(() => {
-      try { socket.close(); } catch (e) { /* 忽略 */ }
-      reject(new Error('连接超时 ' + target.hostname + ':' + target.port));
-    }, timeoutMs > 0 ? timeoutMs : 8000);
-  });
   try {
-    await Promise.race([socket.opened, timerP]);
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          try { if (onTimeout) onTimeout(); } catch (e) { /* 忽略 */ }
+          reject(new Error(msg || '连接超时'));
+        }, ms > 0 ? ms : OUTBOUND_PROXY_MS);
+      })
+    ]);
+  } finally {
     clearTimeout(timer);
+  }
+}
+async function openTcpSocket(hostname, port, timeoutMs) {
+  const socket = connect({ hostname, port });
+  try {
+    await raceTimeout(socket.opened, timeoutMs, () => socket.close(), '连接超时 ' + hostname + ':' + port);
     return socket;
   } catch (e) {
-    clearTimeout(timer);
     try { socket.close(); } catch (e2) { /* 忽略 */ }
     throw e;
   }
 }
+async function connectDirect(target, timeoutMs) {
+  return openTcpSocket(target.hostname, target.port, timeoutMs > 0 ? timeoutMs : OUTBOUND_DIRECT_MS);
+}
 // 通过 SOCKS5 代理建立到目标的连接
-async function connectViaSocks5(proxy, target) {
-  const socket = connect({hostname: proxy.host, port: proxy.port});
-  await socket.opened;
+async function connectViaSocks5(proxy, target, timeoutMs) {
+  const ms = timeoutMs > 0 ? timeoutMs : OUTBOUND_PROXY_MS;
+  const socket = await openTcpSocket(proxy.host, proxy.port, ms);
+  const handshake = (async () => {
   const writer = socket.writable.getWriter();
   const reader = socket.readable.getReader();
   // 带缓存的读取器：多余字节保留，避免丢失后续 VLESS 数据流
@@ -1102,11 +1187,19 @@ async function connectViaSocks5(proxy, target) {
   writer.releaseLock();
   reader.releaseLock();
   return socket;
+  })();
+  try {
+    return await raceTimeout(handshake, ms, () => socket.close(), 'SOCKS5 连接超时');
+  } catch (e) {
+    try { socket.close(); } catch (e2) { /* 忽略 */ }
+    throw e;
+  }
 }
 // 通过 HTTP/HTTPS CONNECT 代理建立连接
-async function connectViaHttpProxy(proxy, target) {
-  const socket = connect({ hostname: proxy.host, port: proxy.port });
-  await socket.opened;
+async function connectViaHttpProxy(proxy, target, timeoutMs) {
+  const ms = timeoutMs > 0 ? timeoutMs : OUTBOUND_PROXY_MS;
+  const socket = await openTcpSocket(proxy.host, proxy.port, ms);
+  const handshake = (async () => {
   const writer = socket.writable.getWriter();
   const reader = socket.readable.getReader();
   let authHeader = '';
@@ -1119,6 +1212,13 @@ async function connectViaHttpProxy(proxy, target) {
   writer.releaseLock();
   reader.releaseLock();
   return socket;
+  })();
+  try {
+    return await raceTimeout(handshake, ms, () => socket.close(), 'HTTP 代理连接超时');
+  } catch (e) {
+    try { socket.close(); } catch (e2) { /* 忽略 */ }
+    throw e;
+  }
 }
 async function readN(reader, n) {
   const out = new Uint8Array(n);
@@ -1263,17 +1363,17 @@ async function openOutbound(parsed, cfg, colo, isVless) {
   const proxy = parseProxyAddress(cfg.outboundProxy);
   const mode = cfg.outboundMode || '';
   const viaProxy = proxy ? (proxy.type === 'http' || proxy.type === 'https'
-    ? (t) => connectViaHttpProxy(proxy, t)
-    : (t) => connectViaSocks5(proxy, t)) : null;
+    ? (t, ms) => connectViaHttpProxy(proxy, t, ms)
+    : (t, ms) => connectViaSocks5(proxy, t, ms)) : null;
   const buildAttempts = (target, timeoutMs) => {
     const attempts = [];
     if (mode === 'only') {
-      attempts.push(viaProxy ? () => viaProxy(target) : () => connectDirect(target, timeoutMs));
+      attempts.push(viaProxy ? () => viaProxy(target, timeoutMs) : () => connectDirect(target, timeoutMs));
     } else if (mode === 'no') {
       attempts.push(() => connectDirect(target, timeoutMs));
-      if (viaProxy) attempts.push(() => viaProxy(target));
+      if (viaProxy) attempts.push(() => viaProxy(target, timeoutMs));
     } else {
-      if (viaProxy) attempts.push(() => viaProxy(target));
+      if (viaProxy) attempts.push(() => viaProxy(target, timeoutMs));
       attempts.push(() => connectDirect(target, timeoutMs));
     }
     return attempts;
@@ -1286,34 +1386,32 @@ async function openOutbound(parsed, cfg, colo, isVless) {
     return null;
   };
   // 1) 优先直连目标（非 CF 网站直连可用；CF 网站回环保护会失败）
-  //    6s 连接超时：目标 SYN 被丢弃 / 直连被回环保护拦截时不再无限挂起，及时进入反代兜底
-  const directResult = await tryConnect({ hostname: parsed.addr, port: parsed.port }, 6000);
+  //    ~2.5s 连接超时：坏路径尽快失败并进入反代兜底，仍保留中继回退
+  const directResult = await tryConnect({ hostname: parsed.addr, port: parsed.port }, OUTBOUND_DIRECT_MS);
   if (directResult) return markVia(directResult, '直连');
   // 2) 用户自定义 proxyIP 透明代理（优先于内置反代）
   const relay = cfg.proxyIP ? parseHostPort(cfg.proxyIP, 443) : null;
   if (relay && relay.host) {
     let customTargets = await resolveProxyIPs(relay.host, relay.port);
     if (!customTargets.length) customTargets = [{ hostname: relay.host, port: relay.port }];
-    for (const target of customTargets) {
-      const r = await tryConnect(target, 6000);
+    for (const target of customTargets.slice(0, RELAY_TARGET_LIMIT)) {
+      const r = await tryConnect(target, OUTBOUND_RELAY_MS);
       if (r) return markVia(r, '自定义落地');
     }
   }
   // 3) 兜底内置地区反代（透明代理：发送去掉 VLESS/Trojan 头部的原始 TLS 数据，对端按 SNI 路由到目标）
-  //    多地区轮询：本地区域优先，失败后依次尝试其余区域；单个反代失效不再导致
-  //    （尤其 CF 托管站点直连被回环保护拦截时）流量为 0；VLESS / Trojan / XHTTP 均启用
-  //    （Trojan 无反代兜底时 Clash Verge 测速 gstatic.com 被回环保护拦截 → 节点显示不可用）
+  //    本地区域优先，最多 2 个区域 × 每区 2 个目标；单个反代失效仍可回退，坏路径更快失败
   {
     const primary = selectRelayRegion(colo);
-    const regions = [primary, ...Object.keys(RELAY_DOMAINS).filter(r => r !== primary)].slice(0, 3);
+    const regions = [primary, ...Object.keys(RELAY_DOMAINS).filter(r => r !== primary)].slice(0, RELAY_REGION_LIMIT);
     for (const region of regions) {
       const relayDomain = RELAY_DOMAINS[region];
       if (!relayDomain) continue;
       let relayTargets = [];
       try { relayTargets = await resolveProxyIPs(relayDomain, 443); } catch (e) { /* 忽略 */ }
       if (!relayTargets.length) continue;
-      for (const target of relayTargets) {
-        const r = await tryConnect(target, 5000);
+      for (const target of relayTargets.slice(0, RELAY_TARGET_LIMIT)) {
+        const r = await tryConnect(target, OUTBOUND_RELAY_MS);
         if (r) return markVia(r, '地区反代-' + region);
       }
     }
@@ -2045,6 +2143,13 @@ function filterNodes(nodes, filter) {
   return out;
 }
 // ---------- Clash YAML ----------
+// 控制器 / SS-IN / mixed 认证密钥：按 UUID 稳定派生（订阅刷新不变；不是仓库里的固定口令）
+function clashDerivedSecret(cfg) {
+  return sha224hex(String(cfg && cfg.uuid || 'cfnext') + '|cfnext-clash-ctl').slice(0, 24);
+}
+function renderClashTemplate(cfg) {
+  return CLASH_TEMPLATE.split('__CLASH_SECRET__').join(clashDerivedSecret(cfg));
+}
 // YAML 标量值序列化（裸值或 JSON 字符串，避免特殊字符破坏 YAML）
 function yamlVal(v) {
   if (typeof v === 'boolean' || typeof v === 'number') return String(v);
@@ -2164,7 +2269,7 @@ function generateClash(cfg, nodes) {
 test-url: 'http://www.gstatic.com/generate_204'
 proxies:
 ${proxies.map(p => clashProxyYaml(p)).join('\n')}
-${CLASH_TEMPLATE}
+${renderClashTemplate(cfg)}
 `;
   return yaml;
 }
@@ -2704,7 +2809,7 @@ code.hl{background:var(--card2);padding:2px 6px;border-radius:5px;font-family:ui
     <h2>基础配置</h2>
     <div class="grid">
       <div class="field"><label>面板路径</label><input id="f-path" placeholder="留空使用 UUID"></div>
-      <div class="field"><label>管理密码（留空无需登录）</label><input id="f-admin" type="password" placeholder="可选"></div>
+      <div class="field"><label>管理密码（留空无需登录；******** 表示已设置且不回显）</label><input id="f-admin" type="password" placeholder="可选，******** 表示保持原值"></div>
     </div>
     <div class="grid">
       <div class="field"><label>VLESS UUID</label><input id="f-uuid" placeholder="留空自动生成"></div>
@@ -2779,13 +2884,13 @@ code.hl{background:var(--card2);padding:2px 6px;border-radius:5px;font-family:ui
     <div class="proto-row"><label class="switch"><input type="checkbox" id="f-enableVless"><span class="sl"></span></label><span>启用 VLESS 协议（默认开启）</span></div>
     <div class="proto-row"><label class="switch"><input type="checkbox" id="f-enableTrojan"><span class="sl"></span></label><span>启用 Trojan 协议（已支持Clash Verge）</span></div>
     <div class="proto-row"><label class="switch"><input type="checkbox" id="f-enableXhttp"><span class="sl"></span></label><span>启用 xhttp 协议（须绑定域名并开启gRPC）</span></div>
-    <div class="field" style="margin-top:10px"><label>Trojan 密码（留空用 UUID）</label><input id="f-trojanPassword" placeholder="Trojan 密码"></div>
+    <div class="field" style="margin-top:10px"><label>Trojan 密码（留空用 UUID；******** 表示已设置且不回显）</label><input id="f-trojanPassword" type="password" placeholder="******** 表示保持原值"></div>
   </div>
   <div class="card">
     <h2>落地与出站</h2>
     <div class="grid">
       <div class="field"><label>反代/落地 IP（留空使用内置地区反代，填写后优先，格式 host 或 host:port）</label><input id="f-proxyIP" placeholder="留空使用内置中继"></div>
-      <div class="field"><label>出站代理（可选，socks5:// / http:// 或 host:port）</label><input id="f-outboundProxy" placeholder="socks5://user:pass@1.2.3.4:1080"></div>
+      <div class="field"><label>出站代理（可选，socks5:// / http:// 或 host:port；凭据不回显）</label><input id="f-outboundProxy" placeholder="socks5://user:pass@1.2.3.4:1080"></div>
     </div>
     <div class="field"><label>出站方式</label><select id="f-outboundMode">
       <option value="">默认（优先代理，失败直连）</option>
@@ -3008,7 +3113,7 @@ function renderHeader(){
   if(!CFG) return;
   $('hdrInfo').textContent = '当前版本：' + (CFG.version || '');
 }
-// 右上角版本号按钮：点击检测 GitHub 仓库（PAICNI/CFNext）最新版本
+// 右上角版本号按钮：对比本仓库 leozeli/CFNext 明文版 VERSION，不自动粘贴远端源码
 function checkUpdate(){
   var btn = $('hdrInfo');
   if(btn.getAttribute('data-checking') === '1') return;
@@ -3019,8 +3124,7 @@ function checkUpdate(){
     btn.removeAttribute('data-checking');
     if(!r || !r.ok){ toast((r && r.msg) || '检测失败', 'err'); btn.textContent = old; return; }
     if(r.changed){
-      copyCode(r.code || '');
-      toast('检测到新版本，已复制代码到剪贴板', 'ok');
+      toast('检测到新版本 ' + (r.latest || '') + '（leozeli/CFNext），请到 GitHub 核对后自行更新', 'ok');
       btn.textContent = '检测到新版本 ' + (r.latest || '');
     } else {
       toast('当前为最新版本（' + (r.current || '') + '）', 'ok');
@@ -3031,12 +3135,6 @@ function checkUpdate(){
     toast('检测失败', 'err');
     btn.textContent = old;
   });
-}
-// 复制远端最新代码到剪贴板（提示由 checkUpdate 统一给出，这里不再重复弹"已复制"）
-function copyCode(t){
-  if(navigator.clipboard && navigator.clipboard.writeText){
-    navigator.clipboard.writeText(t).then(function(){}, function(){ fallbackCopy(t); });
-  } else fallbackCopy(t);
 }
 function renderStatus(d){
   var h = '';
@@ -3060,6 +3158,8 @@ function fillForm(){
   $('f-uuid').value = CFG.uuid || '';
   $('f-path').value = CFG.path || '';
   $('f-admin').value = CFG.admin || '';
+  var locks = CFG.secretLocks || {};
+  $('f-admin').disabled = !!locks.admin;
   $('f-host').value = CFG.host || '';
   $('f-alpn').value = CFG.alpn || '';
   $('f-ech').value = CFG.ech ? 'true' : 'false';
@@ -3073,9 +3173,11 @@ function fillForm(){
   $('f-enableVless').checked = CFG.enableVless !== false;
   $('f-enableTrojan').checked = !!CFG.enableTrojan;
   $('f-trojanPassword').value = CFG.trojanPassword || '';
+  $('f-trojanPassword').disabled = !!locks.trojanPassword;
   $('f-enableXhttp').checked = !!CFG.enableXhttp;
   $('f-proxyIP').value = CFG.proxyIP || '';
   $('f-outboundProxy').value = CFG.outboundProxy || '';
+  $('f-outboundProxy').disabled = !!locks.outboundProxy;
   $('f-outboundMode').value = CFG.outboundMode || '';
   var o = CFG.optimizer || {};
   $('o-source').value = o.source || 'wetest_v4';
@@ -3576,17 +3678,15 @@ async function handleRequest(request, env) {
     }
     if (apiName === 'config') {
       if (request.method === 'GET') {
-        return json({ ok: true, data: Object.assign({}, cfg, { version: VERSION }) });
+        return json({ ok: true, data: redactConfigForClient(cfg, env) });
       }
       if (request.method === 'POST') {
         try {
           const body = await request.json();
-          const merged = Object.assign(JSON.parse(JSON.stringify(cfg)), body);
-          if (body.optimizer && typeof body.optimizer === 'object') merged.optimizer = Object.assign(merged.optimizer, body.optimizer);
-          if (body.preferredIPs && Array.isArray(body.preferredIPs)) merged.preferredIPs = body.preferredIPs;
+          const merged = applyConfigPatch(cfg, body, env);
           await saveConfig(env, merged);
           const fresh = await loadConfig(env, { force: true });
-          return json({ ok: true, data: Object.assign({}, fresh, { version: VERSION }), msg: '已保存并生效' });
+          return json({ ok: true, data: redactConfigForClient(fresh, env), msg: '已保存并生效' });
         } catch (e) { return json({ ok: false, msg: '保存失败: ' + (e.message || e) }, 500); }
       }
     }
@@ -3606,14 +3706,14 @@ async function handleRequest(request, env) {
       return json({ ok: true, data: { version: VERSION, host: url.hostname, path: panelPath, region: (request.cf && request.cf.colo) || 'unknown' } });
     }
     if (apiName === 'check-update') {
-      // 拉取 GitHub 仓库最新版源码：提取远端 VERSION 与本地对比；changed=true 时返回完整代码供前端复制
+      // 仅对比本仓库 leozeli/CFNext 明文版 VERSION；不回传整份源码，避免一键粘贴未审阅代码
       try {
         const res = await fetchTimeout(UPDATE_RAW_URL, { headers: { 'User-Agent': 'Mozilla/5.0' } }, 8000);
         if (!res || !res.ok) return json({ ok: false, msg: '仓库拉取失败 HTTP ' + (res && res.status) }, 502);
-        const code = await res.text();
-        const m = code.match(/const\s+VERSION\s*=\s*['"]([^'"]+)['"]/);
+        const text = await res.text();
+        const m = text.match(/const\s+VERSION\s*=\s*['"]([^'"]+)['"]/);
         const latest = m ? m[1] : '';
-        return json({ ok: true, changed: !!latest && latest !== VERSION, latest: latest, current: VERSION, code: code });
+        return json({ ok: true, changed: !!latest && latest !== VERSION, latest: latest, current: VERSION, url: UPDATE_RAW_URL });
       } catch (e) {
         return json({ ok: false, msg: '检测失败: ' + (e.message || e) }, 500);
       }

@@ -6,6 +6,17 @@
 
 
 ---
+# 更新日志 _V1.0.7
+
+## ✨ 安全 / 性能（明文版）
+- **GET `/api/config` 脱敏**：登录后仍返回 UUID 等面板所需字段；`admin`、`trojanPassword`、出站代理凭据改为 `********`，不再明文回传。表单里保留掩码再保存不会清空密钥；环境变量 `ADMIN` / `TROJAN_PASSWORD` / `S` 强制生效，面板 POST 与 KV 无法覆盖
+- **POST `/api/config` 白名单**：只接受已知字段（协议开关、优选、筛选、出站模式等），忽略未知键，不再整包 `Object.assign`
+- **Trojan 只认 SHA224(密码)**（密码留空用 UUID）。已去掉「任意 56 hex + CRLF ⇒ Trojan」兜底；用错密码的旧客户端会连不上，VLESS 路径不变
+- **出站更快失败**：直连 / 中继约 2.5s，SOCKS/HTTP 代理增加连接超时；地区反代改为最多 2 区 × 每区 2 个目标，仍保留中继兜底
+- **Clash 订阅默认**：`allow-lan: false`，SS-IN / mixed 只听 `127.0.0.1`；控制器 `secret` 与入站密码改为按 UUID 派生（`sha224(uuid|cfnext-clash-ctl)` 前 24 位 hex），不再使用仓库固定口令 `yyds666`
+- **检测更新**：对比本仓库 `leozeli/CFNext` 明文版 `VERSION`，不再拉取/粘贴上游整份源码
+
+---
 # 更新日志 _移除用量统计
 
 ## ✨ 更新内容
@@ -136,7 +147,7 @@
 | 10 | **ECH 加密** | 自定义 ECH 域名 / ECH DNS（DoH），开启后自动进入仅 TLS 节点模式 |
 | 11 | **多客户端** | Clash / Sing-box / Surge / Loon / Quantumult X / V2ray / Shadowrocket / Nekoray / Stash，按 UA 自动识别（URL 追加 `?format=` 可强制指定） |
 | 12 | **日间 / 夜间模式** | 面板右上角一键切换，选择持久化到本地 |
-| 13 | **配置 API** | `/api/config` GET/POST 读写配置，便于脚本化管理 |
+| 13 | **配置 API** | `/api/config` GET（脱敏，不含明文密码）/ POST（白名单字段）读写配置 |
 
 ---
 
