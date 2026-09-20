@@ -1655,10 +1655,10 @@ async function handleWebSocketProxy(request, cfg, env) {
       if (!headerSent) {
         // 累积缓冲：Workers 端 WS 消息可能分片到达，不足头部长度时等待后续数据
         pending = pending ? concatBytes(pending, chunk) : chunk;
-        let parsed, isVless;
+        let parsed, isVless, isTrojan;
         try {
           // Trojan 判定：客户端发送 SHA224(密码) 的 56 字节 hex + CRLF；密码与节点生成同源（留空用 UUID）
-          let isTrojan = detectTrojan(pending, cfg);
+          isTrojan = detectTrojan(pending, cfg);
           // 分帧等待：部分客户端（mihomo 等）将 Trojan 头分帧发送（首帧可能仅 56 字节 SHA224 hex）。
           // 此时 pending[0] 为 hex 字符（非 0）且不足 58 字节，不能按 VLESS 解析（会报版本错误而关闭连接），应等待后续分片
           if (!isTrojan && pending.byteLength > 0 && pending[0] !== 0 && pending.byteLength < 58) return;
