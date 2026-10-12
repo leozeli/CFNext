@@ -13,7 +13,7 @@
 ---
 # 更新日志 \_fork（leozeli，叠在上游 V2.7.3 上）
 
-部署请用明文版 `CFNext-明文版.js`。混淆版、小说混淆版和 Pages 压缩包是上游构建产物，没有下面这些改动。
+明文版 `CFNext-明文版.js`、混淆版 `CFNext-混淆版.js`、小说混淆版 `CFNext-小说混淆版.js` 都包含下面这些改动。`CFNext-混淆Pages版.zip` 仍是上游构建产物，没有这些改动。
 
 - **配置接口**：GET `/api/config` 把 `admin`、`trojanPassword`、`cfApiToken`、`tgBotToken` 显示为 `********`，出站代理 URL 里的账号密码同样打码。表单里留着掩码再保存不会清空密钥。POST 只接受面板已知字段。环境变量 `ADMIN`、`TROJAN_PASSWORD`、`S` / `OUTBOUND`、`CF_API_TOKEN`、`CF_ACCOUNT_ID`、`TGTOKEN` 优先于 KV 和面板。
 - **Trojan**：只接受 `SHA224(密码)`，密码为空时用 UUID。已去掉「任意 56 位 hex + CRLF 就算 Trojan」的兜底。
