@@ -11,6 +11,21 @@
 
 
 ---
+# 更新日志 \_fork（leozeli，叠在上游 V2.7.3 上）
+
+部署请用明文版 `CFNext-明文版.js`。混淆版、小说混淆版和 Pages 压缩包是上游构建产物，没有下面这些改动。
+
+- **配置接口**：GET `/api/config` 把 `admin`、`trojanPassword`、`cfApiToken`、`tgBotToken` 显示为 `********`，出站代理 URL 里的账号密码同样打码。表单里留着掩码再保存不会清空密钥。POST 只接受面板已知字段。环境变量 `ADMIN`、`TROJAN_PASSWORD`、`S` / `OUTBOUND`、`CF_API_TOKEN`、`CF_ACCOUNT_ID`、`TGTOKEN` 优先于 KV 和面板。
+- **Trojan**：只接受 `SHA224(密码)`，密码为空时用 UUID。已去掉「任意 56 位 hex + CRLF 就算 Trojan」的兜底。
+- **Clash**：`allow-lan: false`，`bind-address: 127.0.0.1`，SS-IN 和 mixed 只听 `127.0.0.1`。控制器 secret 和 SS-IN 密码是 `sha224(uuid|cfnext-clash-ctl)` 的前 24 位 hex，不再使用固定口令 `yyds666`。url-test / fallback 健康检查间隔 1800 秒。
+- **检测更新**：只对比本仓库 `leozeli/CFNext` 里对应文件的 `VERSION`，响应不带回整份源码。
+- **根路径**：沿用上游 V2.7 的反跳转（默认欢迎页，`MASK=1101` 为伪造错误页，`MASK=off` 为 404），不再 302 到 UUID 面板。
+- **用量**：不恢复已删除的 KV 键 `usage` 和 `/api/stats`。上游的 Cloudflare GraphQL 配额监控，以及每小时最多写 1 次的 `usageColo` 落点记录，保持原样。
+- **握手**：上游重写了 WebSocket 握手，`isTrojan` 不再在声明它的 `try` 外面被使用。
+- **出站**：沿用上游的并发竞速和现有超时（约 4 秒竞速窗口、约 6 秒连接超时），不改回 1.0.7 的 2.5 秒串行超时。
+- **SS 出站**：修正上游 `return_d(...)` 粘连，aes-128-gcm / aes-256-gcm / chacha20 才能被识别。
+
+---
 # 更新日志 \_V2.7.3
 
 ## 🐛 BUG 处理
